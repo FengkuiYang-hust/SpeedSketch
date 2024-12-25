@@ -1,0 +1,44 @@
+Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+Compiler: C:/MinGW/bin/mingw32-gcc.exe 
+Build flags: 
+Id flags:  
+
+The output was:
+1
+c:/mingw/bin/../lib/gcc/mingw32/6.3.0/../../../../mingw32/lib/crt2.o: file not recognized: File format not recognized
+collect2.exe: error: ld returned 1 exit status
+
+
+Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" failed.
+Compiler: C:/MinGW/bin/mingw32-g++.exe 
+Build flags: 
+Id flags:  
+
+The output was:
+1
+c:/mingw/bin/../lib/gcc/mingw32/6.3.0/../../../../mingw32/lib/crt2.o: file not recognized: File format not recognized
+collect2.exe: error: ld returned 1 exit status
+
+
+Determining if the C compiler works failed with the following output:
+Change Dir: D:/sourcecode/Gdelta-main/build/CMakeFiles/CMakeTmp
+
+Run Build Command(s):C:/MinGW/bin/mingw32-make.exe cmTC_3fa9e/fast && C:/MinGW/bin/mingw32-make.exe -f CMakeFiles\cmTC_3fa9e.dir\build.make CMakeFiles/cmTC_3fa9e.dir/build
+mingw32-make.exe[1]: Entering directory 'D:/sourcecode/Gdelta-main/build/CMakeFiles/CMakeTmp'
+Building C object CMakeFiles/cmTC_3fa9e.dir/testCCompiler.c.obj
+C:\MinGW\bin\mingw32-gcc.exe    -o CMakeFiles\cmTC_3fa9e.dir\testCCompiler.c.obj   -c D:\sourcecode\Gdelta-main\build\CMakeFiles\CMakeTmp\testCCompiler.c
+Linking C executable cmTC_3fa9e.exe
+"C:\Program Files\CMake\bin\cmake.exe" -E cmake_link_script CMakeFiles\cmTC_3fa9e.dir\link.txt --verbose=1
+"C:\Program Files\CMake\bin\cmake.exe" -E remove -f CMakeFiles\cmTC_3fa9e.dir/objects.a
+C:\MinGW\bin\ar.exe cr CMakeFiles\cmTC_3fa9e.dir/objects.a @CMakeFiles\cmTC_3fa9e.dir\objects1.rsp
+C:\MinGW\bin\mingw32-gcc.exe      -Wl,--whole-archive CMakeFiles\cmTC_3fa9e.dir/objects.a -Wl,--no-whole-archive  -o cmTC_3fa9e.exe -Wl,--out-implib,libcmTC_3fa9e.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\cmTC_3fa9e.dir\linklibs.rsp
+c:/mingw/bin/../lib/gcc/mingw32/6.3.0/../../../../mingw32/lib/crt2.o: file not recognized: File format not recognized
+collect2.exe: error: ld returned 1 exit status
+CMakeFiles\cmTC_3fa9e.dir\build.make:87: recipe for target 'cmTC_3fa9e.exe' failed
+mingw32-make.exe[1]: *** [cmTC_3fa9e.exe] Error 1
+mingw32-make.exe[1]: Leaving directory 'D:/sourcecode/Gdelta-main/build/CMakeFiles/CMakeTmp'
+Makefile:120: recipe for target 'cmTC_3fa9e/fast' failed
+mingw32-make.exe: *** [cmTC_3fa9e/fast] Error 2
+
+
+
