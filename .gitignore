@@ -30,6 +30,18 @@
 *.exe
 *.out
 *.app
+/speedsketch
+/speedsketch_asan
+/speedsketch_tsan
+/test_gdelta
+/test_gdelta_asan
+/test_gdelta_tsan
+/test_core
+/test_core_asan
+/test_core_tsan
+/.build/
+__pycache__/
+*.pyc
 
 #others
 *.vscode

@@ -1,1215 +1,642 @@
-#include <cstdlib>
-#include <cstring>
-#include <cstdint>
-#include <algorithm>
-using namespace std;
-
 #include "gdelta.h"
 #include "gear_matrix.h"
-//#include "jemalloc/jemalloc.h"
+#include "sketch_contract.h"
 
-#pragma pack(push, 1)
-/*
- * ABI:
- *
- * VarInt<N>: more 1 | pval N [more| VarInt<7>]
- * DeltaHead: flag 1 | VarInt<6>
- * DeltaUnit: DeltaHead [DeltaHead.flag| VarInt<7>]
- *
- * VarInt <- Val, Offset = Val | VarInt[i].pval << Offset, Offset + VarInt[i]::N
- */
-template<uint8_t FLAGLEN>
-struct _DeltaHead {
-    uint8_t flag: FLAGLEN;
-    uint8_t more: 1;
-    uint8_t length: (7 - FLAGLEN);
-    const static uint8_t lenbits = FLAGLEN;
-//    const static uint8_t lenbits = (7 - FLAGLEN);
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
+
+namespace {
+
+constexpr std::size_t kWordSize = WordSize;
+constexpr std::size_t kLegacyCapacity = ChunkSize;
+constexpr std::size_t kLegacyInitialCapacity = INIT_BUFFER_SIZE;
+constexpr std::uint8_t kVarintPayloadMask = 0x7f;
+constexpr std::uint8_t kHeadLengthMask = 0x3f;
+// The original on-disk format shifts the continuation by FLAGLEN (one bit),
+// even though the first byte physically reserves six bits for length.
+constexpr unsigned kLegacyHeadValueBits = 1;
+
+struct DeltaUnit {
+    bool copy = false;
+    std::uint64_t length = 0;
+    std::uint64_t offset = 0;
 };
 
-typedef _DeltaHead<1> DeltaHeadUnit;
+struct Reader {
+    const std::uint8_t* data;
+    std::size_t size;
+    std::size_t cursor;
+};
 
-typedef struct _VarIntPart {
-    uint8_t more: 1;
-    uint8_t subint: 7;
-    const static uint8_t lenbits = 7;
-} VarIntPart;
+struct DeltaLayout {
+    std::size_t instruction_offset;
+    std::size_t instruction_size;
+    std::size_t literal_offset;
+    std::size_t output_size;
+};
 
-#pragma pack(pop)
+bool valid_buffer(const std::uint8_t* buffer, std::size_t size) {
+    return buffer != nullptr || size == 0;
+}
 
-typedef struct {
-    uint8_t flag;
-    uint64_t length;
-    uint64_t offset;
-} DeltaUnitMem;
-
-// DeltaUnit/FlaggedVarInt: flag: 1, more: 1, len: 6
-// VarInt: more: 1, len: 7
-static_assert(sizeof(DeltaHeadUnit) == 1, "Expected DeltaHeads to be 1 byte");
-static_assert(sizeof(VarIntPart) == 1, "Expected VarInt to be 1 byte");
-
-
-typedef struct {
-    uint8_t *buf;
-    uint64_t cursor;
-    uint64_t length;
-} BufferStreamDescriptor;
-
-void ensure_stream_length(BufferStreamDescriptor &stream, size_t length) {
-    if (length > stream.length) {
-        stream.buf = (uint8_t *) realloc(stream.buf, length);
-        stream.length = length;
+bool checked_add(std::size_t left, std::size_t right, std::size_t* result) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        return false;
     }
+    *result = left + right;
+    return true;
 }
 
-template<typename T>
-void write_field(BufferStreamDescriptor &buffer, const T &field) {
-    ensure_stream_length(buffer, buffer.cursor + sizeof(T));
-    memcpy(buffer.buf + buffer.cursor, &field, sizeof(T));
-    buffer.cursor += sizeof(T);
-    // TODO: check bounds (buffer->length)?
+bool equal_word(const std::uint8_t* left, const std::uint8_t* right) {
+    std::uint64_t left_word;
+    std::uint64_t right_word;
+    std::memcpy(&left_word, left, sizeof(left_word));
+    std::memcpy(&right_word, right, sizeof(right_word));
+    return left_word == right_word;
 }
 
-
-template<typename T>
-void read_field(BufferStreamDescriptor &buffer, T &field) {
-    memcpy(&field, buffer.buf + buffer.cursor, sizeof(T));
-    buffer.cursor += sizeof(T);
-    // TODO: check bounds (buffer->length)?
+std::uint64_t gear_fingerprint(const std::uint8_t* data) {
+    std::uint64_t fingerprint = 0;
+    for (std::size_t i = 0; i < kWordSize; ++i) {
+        fingerprint = speedsketch_contract::gear_step(fingerprint, data[i]);
+    }
+    return fingerprint;
 }
 
-inline
-void stream_into(BufferStreamDescriptor &dest, BufferStreamDescriptor &src, size_t length) {
-    ensure_stream_length(dest, dest.cursor + length);
-    memcpy(dest.buf + dest.cursor, src.buf + src.cursor, length);
-    dest.cursor += length;
-    src.cursor += length;
+std::uint64_t roll_fingerprint(std::uint64_t fingerprint, std::uint8_t next) {
+    return speedsketch_contract::gear_step(fingerprint, next);
 }
 
-inline
-void stream_from(BufferStreamDescriptor &dest, const BufferStreamDescriptor &src, size_t src_cursor, size_t length) {
-    ensure_stream_length(dest, dest.cursor + length);
-    memcpy(dest.buf + dest.cursor, src.buf + src_cursor, length);
-    dest.cursor += length;
+bool sketch_bit_matches(std::uint64_t fingerprint,
+                        std::uint64_t new_hash,
+                        std::uint64_t base_hash) {
+    return speedsketch_contract::sketch_bits_match(fingerprint, new_hash, base_hash);
 }
 
-inline
-void write_concat_buffer(BufferStreamDescriptor &dest, const BufferStreamDescriptor &src) {
-    ensure_stream_length(dest, dest.cursor + src.cursor + 1);
-    memcpy(dest.buf + dest.cursor, src.buf, src.cursor);
-    dest.cursor += src.cursor;
-}
-
-inline
-uint64_t read_varint(BufferStreamDescriptor &buffer) {
-    VarIntPart vi;
-    uint64_t val = 0;
-    uint8_t offset = 0;
+void write_varint(std::vector<std::uint8_t>& output, std::uint64_t value) {
     do {
-        read_field(buffer, vi);
-        val |= vi.subint << offset;
-        offset += VarIntPart::lenbits;
-    } while (vi.more);
-    return val;
+        std::uint8_t byte = static_cast<std::uint8_t>((value & kVarintPayloadMask) << 1);
+        value >>= 7;
+        if (value != 0) {
+            byte |= 1;
+        }
+        output.push_back(byte);
+    } while (value != 0);
 }
 
-inline
-void read_unit(BufferStreamDescriptor &buffer, DeltaUnitMem &unit) {
-    DeltaHeadUnit head;
-    read_field(buffer, head);
-
-    unit.flag = head.flag;
-    unit.length = head.length;
-    if (head.more) {
-        unit.length = read_varint(buffer) << DeltaHeadUnit::lenbits | unit.length;
-    }
-    if (head.flag) {
-        unit.offset = read_varint(buffer);
-    }
-#if DEBUG_UNITS
-    fprintf(stderr, "Reading unit %d %zu %zu\n", unit.flag, unit.length, unit.offset);
-#endif
-}
-
-const uint8_t varint_mask = ((1 << VarIntPart::lenbits) - 1);
-const uint8_t head_varint_mask = ((1 << DeltaHeadUnit::lenbits) - 1);
-
-void write_varint(BufferStreamDescriptor &buffer, uint64_t val) {
-    VarIntPart vi;
+std::size_t write_varint(std::uint8_t output[10], std::uint64_t value) {
+    std::size_t size = 0;
     do {
-        vi.subint = val & varint_mask;
-        val >>= VarIntPart::lenbits;
-        if (val == 0) {
-            vi.more = 0;
-            write_field(buffer, vi);
-            break;
+        std::uint8_t byte = static_cast<std::uint8_t>((value & kVarintPayloadMask) << 1);
+        value >>= 7;
+        if (value != 0) {
+            byte |= 1;
         }
-        vi.more = 1;
-        write_field(buffer, vi);
-    } while (1);
+        output[size++] = byte;
+    } while (value != 0);
+    return size;
 }
 
-void write_unit(BufferStreamDescriptor &buffer, const DeltaUnitMem &unit) {
-    // TODO: Abort if length 0?
-#if DEBUG_UNITS
-    fprintf(stderr, "Writing unit %d %zu %zu\n", unit.flag, unit.length, unit.offset);
-#endif
-
-    DeltaHeadUnit head = {unit.flag, unit.length > head_varint_mask, (uint8_t) (unit.length & head_varint_mask)};
-    write_field(buffer, head);
-//  cout<<head_varint_mask<<endl;
-    uint64_t remaining_length = unit.length >> DeltaHeadUnit::lenbits;
-    if (remaining_length)
-        write_varint(buffer, remaining_length);
-//  write_varint(buffer, remaining_length);
-    if (unit.flag) {
-        write_varint(buffer, unit.offset);
+void write_unit(std::vector<std::uint8_t>& instructions, const DeltaUnit& unit) {
+    const bool more = unit.length > 1;
+    const std::uint8_t head =
+        static_cast<std::uint8_t>((unit.copy ? 1 : 0) |
+                                  (more ? 2 : 0) |
+                                  ((unit.length & 1) << 2));
+    instructions.push_back(head);
+    if (more) {
+        write_varint(instructions, unit.length >> kLegacyHeadValueBits);
+    }
+    if (unit.copy) {
+        write_varint(instructions, unit.offset);
     }
 }
 
+bool read_byte(Reader& input, std::uint8_t* value) {
+    if (input.cursor >= input.size) {
+        return false;
+    }
+    *value = input.data[input.cursor++];
+    return true;
+}
 
-void GFixSizeChunking(unsigned char *data, int len, int begflag, int begsize,
-                      uint32_t *hash_table, int mask, uint64_t hashMask) {
-    if (len < WordSize)
+bool read_varint(Reader& input, std::uint64_t* value) {
+    std::uint64_t result = 0;
+    unsigned shift = 0;
+    for (unsigned part = 0; part < 10; ++part, shift += 7) {
+        std::uint8_t byte;
+        if (!read_byte(input, &byte)) {
+            return false;
+        }
+        const std::uint64_t payload = byte >> 1;
+        if (payload > (std::numeric_limits<std::uint64_t>::max() >> shift)) {
+            return false;
+        }
+        result |= payload << shift;
+        if ((byte & 1) == 0) {
+            *value = result;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_unit(Reader& instructions, DeltaUnit* unit) {
+    std::uint8_t head;
+    if (!read_byte(instructions, &head)) {
+        return false;
+    }
+
+    unit->copy = (head & 1) != 0;
+    unit->length = (head >> 2) & kHeadLengthMask;
+    unit->offset = 0;
+    if ((head & 2) != 0) {
+        std::uint64_t remaining;
+        if (!read_varint(instructions, &remaining) ||
+            remaining > (std::numeric_limits<std::uint64_t>::max() >>
+                         kLegacyHeadValueBits)) {
+            return false;
+        }
+        unit->length |= remaining << kLegacyHeadValueBits;
+    }
+    if (unit->copy && !read_varint(instructions, &unit->offset)) {
+        return false;
+    }
+    return unit->length != 0;
+}
+
+void emit_copy(GdeltaWorkspace& workspace, std::size_t offset, std::size_t length) {
+    if (length == 0) {
         return;
-
-    int i = 0;
-    int movebitlength = sizeof(FPTYPE) * 8 / WordSize;
-    if (sizeof(FPTYPE) * 8 % WordSize != 0)
-        movebitlength++;
-    FPTYPE fingerprint = 0;
-
-    /** GEAR **/
-    for (; i < WordSize; i++) {
-        // fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i]];
     }
-
-    i -= WordSize;
-    FPTYPE index = 0;
-    int numChunks = len - WordSize;
-
-    int _begsize = begflag ? begsize : 0;
-    int indexMoveLength = (sizeof(FPTYPE) * 8 - mask);
-
-    // while (i < numChunks) {
-    //     index = (fingerprint) >> indexMoveLength;
-    //     hash_table[index] = i + _begsize;
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize]];
-    //     i++;
-    // }
-
-    // 计算位掩码
-    FPTYPE indexMoveLength_mask = (1 << mask) - 1;
-    while (i < numChunks) {
-        index = ((fingerprint) & indexMoveLength_mask);
-        hash_table[index] = i + _begsize;
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize]];
-        i++;
-    }
-
-    return;
+    write_unit(workspace.instructions,
+               {true, static_cast<std::uint64_t>(length),
+                static_cast<std::uint64_t>(offset)});
 }
 
-
-void GFixSizeChunking2(unsigned char *data, int len, int begflag, int begsize,
-                       uint32_t *hash_table, int mask, uint64_t hashMask) {
-    if (len < WordSize)
+void emit_literal(GdeltaWorkspace& workspace,
+                  const std::uint8_t* input,
+                  std::size_t offset,
+                  std::size_t length) {
+    if (length == 0) {
         return;
-
-    int i = 0;
-    int movebitlength = sizeof(FPTYPE) * 8 / WordSize;
-    if (sizeof(FPTYPE) * 8 % WordSize != 0)
-        movebitlength++;
-    FPTYPE fingerprint = 0;
-
-    /** GEAR **/
-    for (; i < WordSize; i++) {
-        // fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i]];
     }
-
-    i -= WordSize;
-    FPTYPE index = 0;
-    int numChunks = len - WordSize - 1;
-
-    int _begsize = begflag ? begsize : 0;
-    int indexMoveLength = (sizeof(FPTYPE) * 8 - mask);
-
-    // while (i < numChunks) {
-    //     index = (fingerprint) >> indexMoveLength;
-    //     hash_table[index] = i + _begsize;
-    //     fingerprint = (fingerprint << 2) + Gearmx_l[data[i + WordSize]] + GEARmx[data[i + WordSize + 1]];
-    //     i+=2;
-    // }
-
-    // 计算位掩码
-    FPTYPE indexMoveLength_mask = (1 << mask) - 1;
-    while (i < numChunks) {
-        index = ((fingerprint) & indexMoveLength_mask);
-        hash_table[index] = i + _begsize;
-        fingerprint = (fingerprint >> 2) + Gearmx_l[data[i + WordSize]] + GEARmx[data[i + WordSize + 1]];
-        i+=2;
-    }
-
+    write_unit(workspace.instructions,
+               {false, static_cast<std::uint64_t>(length), 0});
+    workspace.data.insert(workspace.data.end(), input + offset, input + offset + length);
 }
 
-void GFixSizeChunking_3(unsigned char *data, int len, int begflag, int begsize,
-                      uint32_t *hash_table, int mask, uint64_t hashMask) {
-    if (len < WordSize)
-        return;
-
-    int i = 0;
-    int movebitlength = sizeof(FPTYPE) * 8 / WordSize;
-    if (sizeof(FPTYPE) * 8 % WordSize != 0)
-        movebitlength++;
-    FPTYPE fingerprint = 0;
-
-    /** GEAR **/
-    for (; i < WordSize; i++) {
-        // fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i]];
+int build_hash_table(const std::uint8_t* base,
+                     std::size_t begin,
+                     std::size_t end,
+                     GdeltaWorkspace& workspace) {
+    const std::size_t length = end - begin;
+    if (length < kWordSize) {
+        workspace.hash_table.clear();
+        return GDELTA_OK;
     }
 
-    i -= WordSize;
-    FPTYPE index = 0;
-    int numChunks = len - WordSize - 2;
-
-
-    int _begsize = begflag ? begsize : 0;
-    int indexMoveLength = (sizeof(FPTYPE) * 8 - mask);
-
-    // while (i < numChunks) {
-    //     index = (fingerprint) >> indexMoveLength;
-    //     hash_table[index] = i + _begsize;
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize]];
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize + 1]];
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize + 2]];
-    //     i+=3;
-    // }
-
-    // 计算位掩码
-    FPTYPE indexMoveLength_mask = (1 << mask) - 1;
-    while (i < numChunks) {
-        index = ((fingerprint) & indexMoveLength_mask);
-        hash_table[index] = i + _begsize;
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize + 1]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize + 2]];
-        i+=3;
+    std::size_t desired;
+    if (!checked_add(length, 10, &desired)) {
+        return GDELTA_INVALID_ARGUMENT;
     }
+    std::size_t hash_size = 1;
+    while (hash_size < desired) {
+        if (hash_size > std::numeric_limits<std::size_t>::max() / 2) {
+            return GDELTA_INVALID_ARGUMENT;
+        }
+        hash_size *= 2;
+    }
+    workspace.hash_table.assign(hash_size, 0);
 
+    const std::size_t mask = hash_size - 1;
+    std::size_t position = begin;
+    std::uint64_t fingerprint = gear_fingerprint(base + position);
+    while (position + kWordSize < end) {
+        const std::size_t index = static_cast<std::size_t>(fingerprint) & mask;
+        // offset+1 reserves zero as the empty sentinel and makes base offset zero usable.
+        workspace.hash_table[index] = static_cast<std::uint32_t>(position + 1);
+        ++position;
+        fingerprint = roll_fingerprint(fingerprint, base[position + kWordSize - 1]);
+    }
+    return GDELTA_OK;
 }
 
-void GFixSizeChunking_4(unsigned char *data, int len, int begflag, int begsize,
-                        uint32_t *hash_table, int mask, uint64_t hashMask) {
-    if (len < WordSize)
-        return;
-
-    int i = 0;
-    int movebitlength = sizeof(FPTYPE) * 8 / WordSize;
-    if (sizeof(FPTYPE) * 8 % WordSize != 0)
-        movebitlength++;
-    FPTYPE fingerprint = 0;
-
-    /** GEAR **/
-    for (; i < WordSize; i++) {
-        // fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i]];
+int inspect_delta(const std::uint8_t* delta,
+                  std::size_t delta_size,
+                  std::size_t base_size,
+                  DeltaLayout* layout) {
+    Reader header{delta, delta_size, 0};
+    std::uint64_t instruction_size_u64;
+    if (!read_varint(header, &instruction_size_u64) ||
+        instruction_size_u64 > std::numeric_limits<std::size_t>::max()) {
+        return GDELTA_INVALID_DELTA;
+    }
+    const std::size_t instruction_size = static_cast<std::size_t>(instruction_size_u64);
+    if (instruction_size > delta_size - header.cursor) {
+        return GDELTA_INVALID_DELTA;
     }
 
-    i -= WordSize;
-    FPTYPE index = 0;
-    int numChunks = len - WordSize - 3;
-
-    int flag = 0;
-    int _begsize = begflag ? begsize : 0;
-    int indexMoveLength = (sizeof(FPTYPE) * 8 - mask);
-
-    // while (i < numChunks) {
-    //     index = (fingerprint) >> indexMoveLength;
-    //     hash_table[index] = i + _begsize;
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize]];
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize + 1]];
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize + 2]];
-    //     fingerprint = (fingerprint << (movebitlength)) + GEARmx[data[i + WordSize + 3]];
-    //     i+=4;
-    // }
-
-    // 计算位掩码
-    FPTYPE indexMoveLength_mask = (1 << mask) - 1;
-    while (i < numChunks) {
-        index = ((fingerprint) & indexMoveLength_mask);
-        hash_table[index] = i + _begsize;
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize + 1]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize + 2]];
-        fingerprint = (fingerprint >> (movebitlength)) + GEARmx[data[i + WordSize + 3]];
-        i+=4;
-    }
-
-}
-
-
-int gencode(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
-            uint32_t baseSize, uint8_t **deltaBuf, uint32_t *deltaSize) {
-#if PRINT_PERF
-    struct timespec tf0, tf1;
-    clock_gettime(CLOCK_MONOTONIC, &tf0);
-#endif
-
-    /* detect the head and tail of one chunk */
-    uint32_t beg = 0, end = 0, begSize = 0, endSize = 0;
-
-    if (*deltaBuf == nullptr) {
-        *deltaBuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
-    }
-
-
-    uint8_t *databuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
-    uint8_t *instbuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
-
-
-    // Find first difference
-    // First in 8 byte blocks and then in 1 byte blocks for speed
-    while (begSize + sizeof(uint64_t) <= baseSize &&
-           begSize + sizeof(uint64_t) <= newSize &&
-           *(uint64_t *) (baseBuf + begSize) == *(uint64_t *) (newBuf + begSize)) {
-        begSize += sizeof(uint64_t);
-    }
-
-    while (begSize < baseSize &&
-           begSize < newSize &&
-           baseBuf[begSize] == newBuf[begSize]) {
-        begSize++;
-    }
-
-    if (begSize > 16)
-        beg = 1;
-    else
-        begSize = 0;
-
-    // Find first difference (from the end)
-    while (endSize + sizeof(uint64_t) <= baseSize &&
-           endSize + sizeof(uint64_t) <= newSize &&
-           *(uint64_t *) (baseBuf + baseSize - endSize - sizeof(uint64_t)) ==
-           *(uint64_t *) (newBuf + newSize - endSize - sizeof(uint64_t))) {
-        endSize += sizeof(uint64_t);
-    }
-
-    while (endSize < baseSize &&
-           endSize < newSize &&
-           baseBuf[baseSize - endSize - 1] == newBuf[newSize - endSize - 1]) {
-        endSize++;
-    }
-
-    if (begSize + endSize > newSize)
-        endSize = newSize - begSize;
-
-    if (endSize > 16)
-        end = 1;
-    else
-        endSize = 0;
-    /* end of detect */
-
-    BufferStreamDescriptor deltaStream = {*deltaBuf, 0, ChunkSize};
-    BufferStreamDescriptor instStream = {instbuf, 0, INIT_BUFFER_SIZE}; // Instruction stream
-    BufferStreamDescriptor dataStream = {databuf, 0, INIT_BUFFER_SIZE};
-    BufferStreamDescriptor newStream = {newBuf, begSize, newSize};
-    DeltaUnitMem unit = {}; // In-memory represtation of current working unit
-
-    if (begSize + endSize >= baseSize) { // TODO: test this path
-        if (beg) {
-            // Data at start is from the original file, write instruction to copy from base
-            unit.flag = true;
-            unit.offset = 0;
-            unit.length = begSize;      // 因为要参考basechunk进行恢复，所以需要记录的是basechunk的位置信息
-            write_unit(instStream, unit);   // 首先写入标识
+    const std::size_t literal_offset = header.cursor + instruction_size;
+    Reader instructions{delta + header.cursor, instruction_size, 0};
+    Reader literals{delta + literal_offset, delta_size - literal_offset, 0};
+    std::size_t output_size = 0;
+    while (instructions.cursor < instructions.size) {
+        DeltaUnit unit;
+        if (!read_unit(instructions, &unit) ||
+            unit.length > std::numeric_limits<std::size_t>::max()) {
+            return GDELTA_INVALID_DELTA;
         }
-        if (newSize - begSize - endSize > 0) {  // 中间还有剩余
-            int32_t litlen = newSize - begSize - endSize;
-            unit.flag = false;              // 表明是拷贝还是插入？这里是插入，所以是false
-            unit.length = litlen;
-            write_unit(instStream, unit);
-            stream_into(dataStream, newStream, litlen); // 数据起始点在newStream里面
-        }
-        if (end) {  
-            int32_t matchlen = endSize;
-            int32_t offset = baseSize - endSize;    // 起始位置在这里
-            unit.flag = true;
-            unit.offset = offset;
-            unit.length = matchlen;
-            write_unit(instStream, unit);
-        }
-
-        write_varint(deltaStream, instStream.cursor);  
-        write_concat_buffer(deltaStream, instStream);
-        write_concat_buffer(deltaStream, dataStream);
-
-        *deltaSize = deltaStream.cursor;
-        *deltaBuf = deltaStream.buf;
-
-#if PRINT_PERF
-        clock_gettime(CLOCK_MONOTONIC, &tf1);
-        fprintf(stderr, "gencode took: %zdns\n", (tf1.tv_sec - tf0.tv_sec) * 1000000000 + tf1.tv_nsec - tf0.tv_nsec);
-#endif
-        free(dataStream.buf);
-        free(instStream.buf);
-        return deltaStream.cursor;  // 由于前后位置比baseSize还大，所以可以参考所有的数据，
-                            // 但是，可能剩余的部分数据中，有些可以参考baseSize的某些数据项，也就是可以实现自压缩，这里好像没有考虑。
-    }
-
-    /* chunk the baseFile */
-    int32_t tmp = (baseSize - begSize - endSize) + 10;  // baseSize最大近似128*1024，2^(17)，也就是说bit最大是17，那么hashMask的值很小。
-    int32_t bit = 0;
-    for (bit = 0; tmp; bit++)
-        tmp >>= 1;
-
-    uint64_t hashMask = 0XFFFFFFFFFFFFFFFF >> (64 - bit); // mask   // hashMask是为了存指纹的结果，其代表了指纹最后可能得取值。也是机会主义的。
-    uint32_t handleBytes = begSize; // 相同的总字节数
-    FPTYPE fingerprint = 0;
-    uint32_t inputPos = begSize;    // 新块匹配的起始位置
-    uint32_t cursor = 0;
-    uint32_t matchNum = 0;
-    int32_t moveBitLength = 0;
-    uint32_t lastMatchPos = inputPos;
-    uint32_t lastLiteral_begin = inputPos;
-    uint32_t *hash_table = nullptr;
-    uint32_t baseoffset = 0;
-    uint32_t hash_size = hashMask + 1;
-    bool isFindMatch = false;
-
-    if (beg) {
-        // Data at start is from the original file, write instruction to copy from base
-        unit.flag = true;
-        unit.offset = 0;
-        unit.length = begSize;
-        write_unit(instStream, unit);
-        unit.length = 0; // Mark as written
-    }
-
-    uint32_t moveindex = (sizeof(FPTYPE) * 8 - bit);
-
-
-    isFindMatch = true;
-    hash_table = (uint32_t *) malloc(hash_size * sizeof(uint32_t));
-    memset(hash_table, 0, sizeof(uint32_t) * hash_size);
-
-
-#if PRINT_PERF
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-#endif
-
-
-#ifdef BaseSampleRate
-    if(BaseSampleRate == 2 && WordSize == 64)
-    {
-        GFixSizeChunking2(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }else if(BaseSampleRate == 3)
-    {
-        GFixSizeChunking_3(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }else if(BaseSampleRate == 4)
-    {
-        GFixSizeChunking_4(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    } else
-    {
-        GFixSizeChunking(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }
-
-#else
-    GFixSizeChunking(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-#endif
-
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    fprintf(stderr, "size:%d\n", baseSize - begSize - endSize);
-    fprintf(stderr, "hash size:%d\n", hash_size);
-    fprintf(stderr, "rolling hash:%.3fMB/s\n",
-            (double)(baseSize - begSize - endSize) / 1024 / 1024 /
-                ((t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec) *
-                1000000000);
-    fprintf(stderr, "rolling hash:%zd\n",
-            (t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec);
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    fprintf(stderr, "hash table :%zd\n",
-            (t0.tv_sec - t1.tv_sec) * 1000000000 + t0.tv_nsec - t1.tv_nsec);
-#endif
-    /* end of inserting */
-
-
-    if (sizeof(FPTYPE) * 8 % WordSize == 0)
-        moveBitLength = sizeof(FPTYPE) * 8 / WordSize;
-    else
-        moveBitLength = sizeof(FPTYPE) * 8 / WordSize + 1;
-
-
-    for (uint32_t i = 0; i < WordSize && i < newSize - endSize - inputPos; i++) {
-        // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[(newBuf + inputPos)[i]];
-        fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[(newBuf + inputPos)[i]];
-    }
-
-    while (inputPos + WordSize <= newSize - endSize) {  // 使用的都是位置
-        uint32_t length;
-        bool matchflag = false;
-        cursor = inputPos + WordSize;
-        length = WordSize;
-
-        // uint32_t index = (fingerprint) >> moveindex;
-        // 计算位掩码
-        FPTYPE indexMoveLength_mask = (1ULL << bit) - 1;
-        FPTYPE index = ((fingerprint) & indexMoveLength_mask);
-
-        uint32_t offset = 0;    // 如果匹配的话，作为偏移起始位置进行处理
-        baseoffset = hash_table[index]; // 这里的表和通过simhash的区别是什么？是否可以利用simhash进行跳过比较？
-                                    // 这里的哈希表，只取了simhash的前几位，和使用掩码的效果差不多？
-
-        if (baseoffset != 0 && memcmp(newBuf + inputPos, baseBuf + baseoffset, length) == 0) {
-            matchflag = true;
-            offset = baseoffset;
-        }
-
-#ifdef ReverseMatch // 为什么会有反向匹配呢，如果指纹一样，就是按序计算的，前面几个bit的高位和后面几个bit的低位，这是一定的
-        if (baseoffset != 0 && !matchflag) {
-
-            uint32_t i = length;
-            uint8_t *basepos_end = baseBuf + baseoffset + length - 1;
-            uint8_t *inputpos_end = newBuf + inputPos + length - 1;
-            for (; i > 0 && (*basepos_end == *inputpos_end); i--, basepos_end--, inputpos_end--) {
+        const std::size_t length = static_cast<std::size_t>(unit.length);
+        if (unit.copy) {
+            if (unit.offset > base_size || length > base_size - unit.offset) {
+                return GDELTA_INVALID_DELTA;
             }
+        } else {
+            if (length > literals.size - literals.cursor) {
+                return GDELTA_INVALID_DELTA;
+            }
+            literals.cursor += length;
+        }
+        if (!checked_add(output_size, length, &output_size)) {
+            return GDELTA_INVALID_DELTA;
+        }
+    }
+    if (literals.cursor != literals.size) {
+        return GDELTA_INVALID_DELTA;
+    }
 
-            uint32_t matchlen_end = length - i;
+    *layout = {header.cursor, instruction_size, literal_offset, output_size};
+    return GDELTA_OK;
+}
 
-            if (matchlen_end > WordSize / 2) {
+int encode_impl(const std::uint8_t* new_buf,
+                std::size_t new_size,
+                const std::uint8_t* base_buf,
+                std::size_t base_size,
+                bool use_sketch,
+                std::uint64_t new_hash,
+                std::uint64_t base_hash,
+                std::uint8_t* delta_buf,
+                std::size_t delta_capacity,
+                std::size_t* delta_size,
+                GdeltaWorkspace* workspace,
+                GdeltaStats* stats) {
+    if (stats != nullptr) {
+        *stats = {};
+    }
+    if (delta_size == nullptr || workspace == nullptr ||
+        !valid_buffer(new_buf, new_size) || !valid_buffer(base_buf, base_size) ||
+        (delta_buf == nullptr && delta_capacity != 0) ||
+        new_size > std::numeric_limits<std::uint32_t>::max() ||
+        base_size > std::numeric_limits<std::uint32_t>::max()) {
+        return GDELTA_INVALID_ARGUMENT;
+    }
+    *delta_size = 0;
 
-                int j = 0;
-                {
-                    uint8_t *p1 = baseBuf + baseoffset + length;
-                    uint8_t *p2 = newBuf + inputPos + length;
-                    uint32_t *basepos_end1 = (uint32_t *) p1;
-                    uint32_t *inputpos_end1 = (uint32_t *) p2;
+    try {
+        workspace->data.clear();
+        workspace->instructions.clear();
+        if (workspace->data.capacity() < new_size) {
+            workspace->data.reserve(new_size);
+        }
+        const std::size_t instruction_reserve = new_size + 32;
+        if (workspace->instructions.capacity() < instruction_reserve) {
+            workspace->instructions.reserve(instruction_reserve);
+        }
 
-                    for (; p1 + 3 + j < baseBuf + baseSize &&
-                           p2 + 3 + j < newBuf + newSize - endSize &&
-                           (*basepos_end1 == *inputpos_end1); j += 4, basepos_end1++, inputpos_end1++) {
+        const std::size_t common_size = std::min(new_size, base_size);
+        std::size_t prefix = 0;
+        while (prefix + kWordSize <= common_size &&
+               equal_word(base_buf + prefix, new_buf + prefix)) {
+            prefix += kWordSize;
+        }
+        while (prefix < common_size && base_buf[prefix] == new_buf[prefix]) {
+            ++prefix;
+        }
+        if (prefix <= 16) {
+            prefix = 0;
+        }
+
+        std::size_t suffix = 0;
+        const std::size_t suffix_limit = common_size - prefix;
+        while (suffix + kWordSize <= suffix_limit &&
+               equal_word(base_buf + base_size - suffix - kWordSize,
+                          new_buf + new_size - suffix - kWordSize)) {
+            suffix += kWordSize;
+        }
+        while (suffix < suffix_limit &&
+               base_buf[base_size - suffix - 1] == new_buf[new_size - suffix - 1]) {
+            ++suffix;
+        }
+        if (suffix <= 16) {
+            suffix = 0;
+        }
+
+        emit_copy(*workspace, 0, prefix);
+
+        const std::size_t base_end = base_size - suffix;
+        const std::size_t new_end = new_size - suffix;
+        int status = build_hash_table(base_buf, prefix, base_end, *workspace);
+        if (status != GDELTA_OK) {
+            return status;
+        }
+
+        std::size_t position = prefix;
+        std::size_t literal_begin = position;
+        if (!workspace->hash_table.empty()) {
+            const std::size_t hash_mask = workspace->hash_table.size() - 1;
+            bool have_fingerprint = false;
+            std::uint64_t fingerprint = 0;
+            while (position + kWordSize <= new_end) {
+                if (!have_fingerprint) {
+                    fingerprint = gear_fingerprint(new_buf + position);
+                    have_fingerprint = true;
+                }
+
+                bool lookup = true;
+                if (use_sketch) {
+                    if (stats != nullptr) {
+                        ++stats->judgments;
                     }
-
-                }
-                unit.flag = false;
-                unit.length += i;
-                stream_from(dataStream, newStream, lastLiteral_begin, unit.length);
-                write_unit(instStream, unit);
-
-                unit.flag = true;
-                unit.offset = (basepos_end - baseBuf + 1);
-                unit.length = matchlen_end + j;
-
-                write_unit(instStream, unit);
-                unit.length = 0; // Mark written
-                handleBytes += (length + j);
-                inputPos += (length + j);
-                lastLiteral_begin = inputPos;
-                for (int k = 0; k < WordSize && (inputPos + k < newSize - endSize); k++) {
-                    // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[inputPos + k]];
-                    fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[inputPos + k]];
+                    lookup = sketch_bit_matches(fingerprint, new_hash, base_hash);
+                    if (!lookup && stats != nullptr) {
+                        ++stats->excluded_lookups;
+                    }
                 }
 
-                lastMatchPos = inputPos;
-                continue;
+                bool matched = false;
+                std::size_t base_offset = 0;
+                if (lookup) {
+                    const std::uint32_t entry =
+                        workspace->hash_table[static_cast<std::size_t>(fingerprint) & hash_mask];
+                    if (entry != 0) {
+                        base_offset = static_cast<std::size_t>(entry - 1);
+                        matched = base_offset + kWordSize <= base_end &&
+                                  std::memcmp(new_buf + position,
+                                              base_buf + base_offset,
+                                              kWordSize) == 0;
+                    }
+                    if (use_sketch && !matched && stats != nullptr) {
+                        ++stats->false_positive_lookups;
+                    }
+                }
+
+                if (!matched) {
+                    ++position;
+                    if (position + kWordSize <= new_end) {
+                        fingerprint = roll_fingerprint(
+                            fingerprint, new_buf[position + kWordSize - 1]);
+                    }
+                    continue;
+                }
+
+                const std::size_t literal_length = position - literal_begin;
+                std::size_t backward = 0;
+                while (backward < base_offset && backward < literal_length &&
+                       base_buf[base_offset - backward - 1] ==
+                           new_buf[position - backward - 1]) {
+                    ++backward;
+                }
+                emit_literal(*workspace, new_buf, literal_begin,
+                             literal_length - backward);
+                std::size_t match_length = kWordSize;
+                while (base_offset + match_length + kWordSize <= base_end &&
+                       position + match_length + kWordSize <= new_end &&
+                       equal_word(base_buf + base_offset + match_length,
+                                  new_buf + position + match_length)) {
+                    match_length += kWordSize;
+                }
+                while (base_offset + match_length < base_end &&
+                       position + match_length < new_end &&
+                       base_buf[base_offset + match_length] ==
+                           new_buf[position + match_length]) {
+                    ++match_length;
+                }
+                emit_copy(*workspace, base_offset - backward,
+                          match_length + backward);
+                position += match_length;
+                literal_begin = position;
+                have_fingerprint = false;
             }
         }
-#endif
+        emit_literal(*workspace, new_buf, literal_begin, new_end - literal_begin);
+        emit_copy(*workspace, base_size - suffix, suffix);
 
-
-        /* New data match found in hashtable/base data; attempt to create copy instruction*/
-        if (matchflag) {
-            matchNum++;
-            // Check how much is possible to copy
-            int32_t j = 0;
-#if 1 /* 8-bytes optimization */
-            while (offset + length + j + 7 < baseSize - endSize &&      // 如果匹配的话，检查匹配了多少，
-                   cursor + j + 7 < newSize - endSize &&
-                   *(uint64_t *) (baseBuf + offset + length + j) == *(uint64_t *) (newBuf + cursor + j)) {
-                j += sizeof(uint64_t);
-            }
-            while (offset + length + j < baseSize - endSize &&
-                   cursor + j < newSize - endSize &&
-                   baseBuf[offset + length + j] == newBuf[cursor + j]) {    // 最后一个字节一个字节地匹配
-                j++;
-            }
-#endif
-            cursor += j;
-
-            int32_t matchlen = cursor - inputPos;
-            handleBytes += cursor - inputPos;
-            uint64_t _offset = offset;  // 基块匹配位置的实际偏移
-
-            // Check if switching modes Literal -> Copy, and dump instruction if available
-            if (!unit.flag && unit.length) {
-                /* Detect if end of previous literal could have been a partial copy*/
-                uint32_t k = 0;
-                while (k + 1 <= offset && k + 1 <= unit.length) {   // 检测匹配位置之前是否有部分的匹配
-                    if (baseBuf[offset - (k + 1)] == newBuf[inputPos - (k + 1)])
-                        k++;
-                    else
-                        break;
-                }
-
-                if (k > 0) {
-                    // Reduce literal by the amount covered by the copy
-                    unit.length -= k;   // 这里需要对未匹配的进行处理，实际是需要插入的数据的长度
-                    // Set up adjusted copy parameters
-                    matchlen += k;
-                    _offset -= k;
-                }
-
-                if (unit.length != 0)
-                {
-                    write_unit(instStream, unit);
-                    stream_from(dataStream, newStream, lastLiteral_begin, unit.length); // 对前面未匹配的数据进行插入
-                }
-
-                unit.length = 0; // Mark written
-            }
-
-            unit.flag = true;
-            unit.offset = _offset;
-            unit.length = matchlen;
-            write_unit(instStream, unit);   // 对匹配的数据进行拷贝
-            unit.length = 0; // Mark written
-
-            // Update cursor (inputPos) and fingerprint
-            for (uint32_t k = cursor; k < cursor + WordSize && cursor + WordSize < newSize - endSize; k++) {
-                // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[k]];
-                fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[k]];
-            }
-
-            inputPos = cursor;
-            lastMatchPos = cursor;
-            lastLiteral_begin = cursor;
-        } else { // No match, need to write additional (literal) data
-            /*
-             * Accumulate length one byte at a time (as literal) in unit while no match is found
-             * Pre-emptively write to datastream
-             */
-            unit.flag = false;
-            unit.length += 1;
-
-            handleBytes += 1;
-            // Update cursor (inputPos) and fingerprint
-            if (inputPos + WordSize < newSize - endSize) {
-                // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-                fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-            }
-            inputPos++;
-#ifdef SkipOn   
-            int step = ((inputPos - lastMatchPos) >> SkipStep) ;    // 这里lastMatchPos不会更新，所以差距会越来越大， 实际是为了加速
-
-            if(step <= WordSize)    // 在匹配过后会有这样的过程
-            {
-                for(int i = 0; i < step && (inputPos + WordSize < newSize - endSize); i++,inputPos++)
-                {
-                    // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-                    fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-                    handleBytes += 1;
-                    unit.length += 1;
-                }
-            }
-            else    // 在多次触发skip之后，会触发该过程，重新进行计算
-            {
-                fingerprint = 0;
-                int cursor = inputPos + step;
-                int len = 0;
-                for(int i = 0; i < WordSize && (cursor + i < newSize - endSize); i++)
-                {
-                    // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[cursor + i]];
-                    fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[cursor + i]];
-                    len++;
-                }
-                int l = min(newSize - endSize, inputPos + step);
-                int realStep = l - inputPos;
-                handleBytes += realStep;
-                unit.length += realStep;
-                inputPos += realStep;
-            }
-#endif
+        std::uint8_t header[10];
+        const std::size_t header_size =
+            write_varint(header, workspace->instructions.size());
+        std::size_t required;
+        if (!checked_add(header_size, workspace->instructions.size(), &required) ||
+            !checked_add(required, workspace->data.size(), &required)) {
+            return GDELTA_INVALID_ARGUMENT;
         }
-    }
-
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "look up:%zd\n",
-            (t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec);
-    fprintf(stderr, "look up:%.3fMB/s\n",
-            (double)(baseSize - begSize - endSize) / 1024 / 1024 /
-                ((t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec) *
-                1000000000);
-#endif
-
-    endloop:
-    // If last unit was unwritten literal, update it to use the rest of the data
-    if ((!unit.flag && unit.length) || !isFindMatch) {
-        newStream.cursor = lastLiteral_begin;
-        stream_into(dataStream, newStream, newSize - endSize - lastLiteral_begin);
-
-        unit.length = (newSize - endSize - lastLiteral_begin);
-        write_unit(instStream, unit);
-        unit.length = 0;
-    } else { // Last unit was Copy, need new instruction
-        if (newSize - endSize - handleBytes) {
-            newStream.cursor = lastLiteral_begin;
-            stream_into(dataStream, newStream, newSize - endSize - lastLiteral_begin);
-
-            unit.flag = false;
-            unit.length = newSize - endSize - lastLiteral_begin;
-            write_unit(instStream, unit);
-            unit.length = 0;
+        *delta_size = required;
+        if (required > delta_capacity || (required != 0 && delta_buf == nullptr)) {
+            return GDELTA_OUTPUT_TOO_SMALL;
         }
+
+        std::size_t cursor = 0;
+        std::memcpy(delta_buf + cursor, header, header_size);
+        cursor += header_size;
+        if (!workspace->instructions.empty()) {
+            std::memcpy(delta_buf + cursor, workspace->instructions.data(),
+                        workspace->instructions.size());
+            cursor += workspace->instructions.size();
+        }
+        if (!workspace->data.empty()) {
+            std::memcpy(delta_buf + cursor, workspace->data.data(), workspace->data.size());
+        }
+        return GDELTA_OK;
+    } catch (const std::bad_alloc&) {
+        return GDELTA_ALLOCATION_FAILED;
+    } catch (const std::length_error&) {
+        return GDELTA_ALLOCATION_FAILED;
     }
-
-    if (end) {
-        int32_t matchLen = endSize;
-        int32_t offset = baseSize - endSize;
-
-        unit.flag = true;
-        unit.offset = offset;
-        unit.length = matchLen;
-        write_unit(instStream, unit);
-        unit.length = 0;
-    }
-
-    deltaStream.cursor = 0;
-    write_varint(deltaStream, instStream.cursor);
-    write_concat_buffer(deltaStream, instStream);
-    write_concat_buffer(deltaStream, dataStream);
-    *deltaSize = deltaStream.cursor;
-    *deltaBuf = deltaStream.buf;
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &tf1);
-    fprintf(stderr, "gencode took: %zdns\n", (tf1.tv_sec - tf0.tv_sec) * 1000000000 + tf1.tv_nsec - tf0.tv_nsec);
-#endif
-
-    free(dataStream.buf);
-    free(instStream.buf);
-    if (hash_table)
-        free(hash_table);
-
-
-    return deltaStream.cursor;
 }
 
-
-
-int gdecode(uint8_t *deltaBuf, uint32_t deltaSize, uint8_t *baseBuf, uint32_t baseSize,
-            uint8_t **outBuf, uint32_t *outSize) {
-
-    if (*outBuf == nullptr) {
-        *outBuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
+template <typename Encode>
+int legacy_encode(Encode encode,
+                  std::uint32_t new_size,
+                  std::uint8_t** delta_buf,
+                  std::uint32_t* delta_size) {
+    if (delta_buf == nullptr || delta_size == nullptr) {
+        return GDELTA_INVALID_ARGUMENT;
+    }
+    *delta_size = 0;
+    bool allocated = false;
+    std::size_t capacity = kLegacyCapacity;
+    if (*delta_buf == nullptr) {
+        const std::size_t conservative = static_cast<std::size_t>(new_size) * 2 + 32;
+        capacity = std::max(kLegacyInitialCapacity, conservative);
+        *delta_buf = static_cast<std::uint8_t*>(std::malloc(capacity));
+        if (*delta_buf == nullptr) {
+            return GDELTA_ALLOCATION_FAILED;
+        }
+        allocated = true;
     }
 
-#if PRINT_PERF
-    struct timespec tf0, tf1;
-    clock_gettime(CLOCK_MONOTONIC, &tf0);
-#endif
-    BufferStreamDescriptor deltaStream = {deltaBuf, 0, deltaSize}; // Instructions
-    const uint64_t instructionLength = read_varint(deltaStream);
-    const uint64_t instOffset = deltaStream.cursor;
-    BufferStreamDescriptor addDeltaStream = {deltaBuf, deltaStream.cursor + instructionLength, deltaSize};
-    BufferStreamDescriptor outStream = {*outBuf, 0, ChunkSize};   // Data out
-    BufferStreamDescriptor baseStream = {baseBuf, 0, baseSize}; // Data in
-    DeltaUnitMem unit = {};
-
-    while (deltaStream.cursor < instructionLength + instOffset) {
-        read_unit(deltaStream, unit);
-        if (unit.flag) // Read from original file using offset
-            stream_from(outStream, baseStream, unit.offset, unit.length);
-        else          // Read from delta file at current cursor
-            stream_into(outStream, addDeltaStream, unit.length);
+    std::size_t actual = 0;
+    int status = encode(*delta_buf, capacity, &actual);
+    if (status == GDELTA_OUTPUT_TOO_SMALL && allocated) {
+        void* resized = std::realloc(*delta_buf, actual);
+        if (resized == nullptr) {
+            std::free(*delta_buf);
+            *delta_buf = nullptr;
+            return GDELTA_ALLOCATION_FAILED;
+        }
+        *delta_buf = static_cast<std::uint8_t*>(resized);
+        capacity = actual;
+        status = encode(*delta_buf, capacity, &actual);
     }
-
-    *outSize = outStream.cursor;
-    *outBuf = outStream.buf;
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &tf1);
-    fprintf(stderr, "gdecode took: %zdns\n", (tf1.tv_sec - tf0.tv_sec) * 1000000000 + tf1.tv_nsec - tf0.tv_nsec);
-#endif
-    return outStream.cursor;
+    if (status != GDELTA_OK || actual > std::numeric_limits<std::uint32_t>::max() ||
+        actual > static_cast<std::size_t>(INT_MAX)) {
+        if (allocated) {
+            std::free(*delta_buf);
+            *delta_buf = nullptr;
+        }
+        return status == GDELTA_OK ? GDELTA_INVALID_ARGUMENT : status;
+    }
+    *delta_size = static_cast<std::uint32_t>(actual);
+    return static_cast<int>(actual);
 }
 
-int gencodeWHash(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
-            uint32_t baseSize, uint8_t **deltaBuf, uint32_t *deltaSize, uint64_t newHash, uint64_t baseHash) {
-#if PRINT_PERF
-    struct timespec tf0, tf1;
-    clock_gettime(CLOCK_MONOTONIC, &tf0);
-#endif
+}  // namespace
 
-    /* detect the head and tail of one chunk */
-    uint32_t beg = 0, end = 0, begSize = 0, endSize = 0;
+int gencode_into(const std::uint8_t* new_buf, std::size_t new_size,
+                 const std::uint8_t* base_buf, std::size_t base_size,
+                 std::uint8_t* delta_buf, std::size_t delta_capacity,
+                 std::size_t* delta_size, GdeltaWorkspace* workspace,
+                 GdeltaStats* stats) {
+    return encode_impl(new_buf, new_size, base_buf, base_size, false, 0, 0,
+                       delta_buf, delta_capacity, delta_size, workspace, stats);
+}
 
-    if (*deltaBuf == nullptr) {
-        *deltaBuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
+int gencode_whash_into(const std::uint8_t* new_buf, std::size_t new_size,
+                       const std::uint8_t* base_buf, std::size_t base_size,
+                       std::uint64_t new_hash, std::uint64_t base_hash,
+                       std::uint8_t* delta_buf, std::size_t delta_capacity,
+                       std::size_t* delta_size, GdeltaWorkspace* workspace,
+                       GdeltaStats* stats) {
+    return encode_impl(new_buf, new_size, base_buf, base_size, true,
+                       new_hash, base_hash, delta_buf, delta_capacity,
+                       delta_size, workspace, stats);
+}
+
+int gdecode_into(const std::uint8_t* delta_buf, std::size_t delta_size,
+                 const std::uint8_t* base_buf, std::size_t base_size,
+                 std::uint8_t* out_buf, std::size_t out_capacity,
+                 std::size_t* out_size) {
+    if (out_size == nullptr || !valid_buffer(delta_buf, delta_size) ||
+        !valid_buffer(base_buf, base_size) ||
+        (out_buf == nullptr && out_capacity != 0) || delta_size == 0) {
+        return GDELTA_INVALID_ARGUMENT;
+    }
+    *out_size = 0;
+
+    DeltaLayout layout;
+    const int status = inspect_delta(delta_buf, delta_size, base_size, &layout);
+    if (status != GDELTA_OK) {
+        return status;
+    }
+    *out_size = layout.output_size;
+    if (layout.output_size > out_capacity ||
+        (layout.output_size != 0 && out_buf == nullptr)) {
+        return GDELTA_OUTPUT_TOO_SMALL;
     }
 
-
-    uint8_t *databuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
-    uint8_t *instbuf = (uint8_t *) malloc(INIT_BUFFER_SIZE);
-
-
-    // Find first difference
-    // First in 8 byte blocks and then in 1 byte blocks for speed
-    while (begSize + sizeof(uint64_t) <= baseSize &&
-           begSize + sizeof(uint64_t) <= newSize &&
-           *(uint64_t *) (baseBuf + begSize) == *(uint64_t *) (newBuf + begSize)) {
-        begSize += sizeof(uint64_t);
-    }
-
-    while (begSize < baseSize &&
-           begSize < newSize &&
-           baseBuf[begSize] == newBuf[begSize]) {
-        begSize++;
-    }
-
-    if (begSize > 16)
-        beg = 1;
-    else
-        begSize = 0;
-
-    // Find first difference (from the end)
-    while (endSize + sizeof(uint64_t) <= baseSize &&
-           endSize + sizeof(uint64_t) <= newSize &&
-           *(uint64_t *) (baseBuf + baseSize - endSize - sizeof(uint64_t)) ==
-           *(uint64_t *) (newBuf + newSize - endSize - sizeof(uint64_t))) {
-        endSize += sizeof(uint64_t);
-    }
-
-    while (endSize < baseSize &&
-           endSize < newSize &&
-           baseBuf[baseSize - endSize - 1] == newBuf[newSize - endSize - 1]) {
-        endSize++;
-    }
-
-    if (begSize + endSize > newSize)
-        endSize = newSize - begSize;
-
-    if (endSize > 16)
-        end = 1;
-    else
-        endSize = 0;
-    /* end of detect */
-
-    BufferStreamDescriptor deltaStream = {*deltaBuf, 0, ChunkSize};
-    BufferStreamDescriptor instStream = {instbuf, 0, INIT_BUFFER_SIZE}; // Instruction stream
-    BufferStreamDescriptor dataStream = {databuf, 0, INIT_BUFFER_SIZE};
-    BufferStreamDescriptor newStream = {newBuf, begSize, newSize};
-    DeltaUnitMem unit = {}; // In-memory represtation of current working unit
-
-    if (begSize + endSize >= baseSize) { // TODO: test this path
-        if (beg) {
-            // Data at start is from the original file, write instruction to copy from base
-            unit.flag = true;
-            unit.offset = 0;
-            unit.length = begSize;      // 因为要参考basechunk进行恢复，所以需要记录的是basechunk的位置信息
-            write_unit(instStream, unit);   // 首先写入标识
+    Reader instructions{delta_buf + layout.instruction_offset,
+                        layout.instruction_size, 0};
+    Reader literals{delta_buf + layout.literal_offset,
+                    delta_size - layout.literal_offset, 0};
+    std::size_t output_cursor = 0;
+    while (instructions.cursor < instructions.size) {
+        DeltaUnit unit;
+        if (!read_unit(instructions, &unit)) {
+            *out_size = 0;
+            return GDELTA_INVALID_DELTA;
         }
-        if (newSize - begSize - endSize > 0) {  // 中间还有剩余
-            int32_t litlen = newSize - begSize - endSize;
-            unit.flag = false;              // 表明是拷贝还是插入？这里是插入，所以是false
-            unit.length = litlen;
-            write_unit(instStream, unit);
-            stream_into(dataStream, newStream, litlen); // 数据起始点在newStream里面
+        const std::size_t length = static_cast<std::size_t>(unit.length);
+        if (unit.copy) {
+            std::memcpy(out_buf + output_cursor,
+                        base_buf + static_cast<std::size_t>(unit.offset), length);
+        } else {
+            std::memcpy(out_buf + output_cursor, literals.data + literals.cursor, length);
+            literals.cursor += length;
         }
-        if (end) {  
-            int32_t matchlen = endSize;
-            int32_t offset = baseSize - endSize;    // 起始位置在这里
-            unit.flag = true;
-            unit.offset = offset;
-            unit.length = matchlen;
-            write_unit(instStream, unit);
+        output_cursor += length;
+    }
+    *out_size = output_cursor;
+    return GDELTA_OK;
+}
+
+int gencode(const std::uint8_t* new_buf, std::uint32_t new_size,
+            const std::uint8_t* base_buf, std::uint32_t base_size,
+            std::uint8_t** delta_buf, std::uint32_t* delta_size) {
+    thread_local GdeltaWorkspace workspace;
+    return legacy_encode(
+        [&](std::uint8_t* output, std::size_t capacity, std::size_t* actual) {
+            return gencode_into(new_buf, new_size, base_buf, base_size,
+                                output, capacity, actual, &workspace);
+        },
+        new_size, delta_buf, delta_size);
+}
+
+int gencodeWHash(const std::uint8_t* new_buf, std::uint32_t new_size,
+                 const std::uint8_t* base_buf, std::uint32_t base_size,
+                 std::uint8_t** delta_buf, std::uint32_t* delta_size,
+                 std::uint64_t new_hash, std::uint64_t base_hash) {
+    thread_local GdeltaWorkspace workspace;
+    return legacy_encode(
+        [&](std::uint8_t* output, std::size_t capacity, std::size_t* actual) {
+            return gencode_whash_into(new_buf, new_size, base_buf, base_size,
+                                      new_hash, base_hash, output, capacity,
+                                      actual, &workspace);
+        },
+        new_size, delta_buf, delta_size);
+}
+
+int gdecode(const std::uint8_t* delta_buf, std::uint32_t delta_size,
+            const std::uint8_t* base_buf, std::uint32_t base_size,
+            std::uint8_t** out_buf, std::uint32_t* out_size) {
+    if (out_buf == nullptr || out_size == nullptr) {
+        return GDELTA_INVALID_ARGUMENT;
+    }
+    *out_size = 0;
+
+    bool allocated = false;
+    std::size_t capacity = kLegacyCapacity;
+    if (*out_buf == nullptr) {
+        std::size_t required = 0;
+        const int query = gdecode_into(delta_buf, delta_size, base_buf, base_size,
+                                       nullptr, 0, &required);
+        if (query != GDELTA_OUTPUT_TOO_SMALL && query != GDELTA_OK) {
+            return query;
         }
-
-        write_varint(deltaStream, instStream.cursor);  
-        write_concat_buffer(deltaStream, instStream);
-        write_concat_buffer(deltaStream, dataStream);
-
-        *deltaSize = deltaStream.cursor;
-        *deltaBuf = deltaStream.buf;
-
-#if PRINT_PERF
-        clock_gettime(CLOCK_MONOTONIC, &tf1);
-        fprintf(stderr, "gencode took: %zdns\n", (tf1.tv_sec - tf0.tv_sec) * 1000000000 + tf1.tv_nsec - tf0.tv_nsec);
-#endif
-        free(dataStream.buf);
-        free(instStream.buf);
-        return deltaStream.cursor;  // 由于前后位置比baseSize还大，所以可以参考所有的数据，
-                            // 但是，可能剩余的部分数据中，有些可以参考baseSize的某些数据项，也就是可以实现自压缩，这里好像没有考虑。
-    }
-
-    /* chunk the baseFile */
-    int32_t tmp = (baseSize - begSize - endSize) + 10;  // baseSize最大近似128*1024，2^(17)，也就是说bit最大是17，那么hashMask的值很小。
-    int32_t bit = 0;
-    for (bit = 0; tmp; bit++)
-        tmp >>= 1;
-
-    uint64_t hashMask = 0XFFFFFFFFFFFFFFFF >> (64 - bit); // mask   // hashMask是为了存指纹的结果，其代表了指纹最后可能得取值。也是机会主义的。
-    uint32_t handleBytes = begSize; // 相同的总字节数
-    FPTYPE fingerprint = 0;
-    uint32_t inputPos = begSize;    // 新块匹配的起始位置
-    uint32_t cursor = 0;
-    uint32_t matchNum = 0;
-    int32_t moveBitLength = 0;
-    uint32_t lastMatchPos = inputPos;
-    uint32_t lastLiteral_begin = inputPos;
-    uint32_t *hash_table = nullptr;
-    uint32_t baseoffset = 0;
-    uint32_t hash_size = hashMask + 1;
-    bool isFindMatch = false;
-
-    if (beg) {
-        // Data at start is from the original file, write instruction to copy from base
-        unit.flag = true;
-        unit.offset = 0;
-        unit.length = begSize;
-        write_unit(instStream, unit);
-        unit.length = 0; // Mark as written
-    }
-
-    uint32_t moveindex = (sizeof(FPTYPE) * 8 - bit);
-
-    isFindMatch = true;
-    hash_table = (uint32_t *) malloc(hash_size * sizeof(uint32_t));
-    memset(hash_table, 0, sizeof(uint32_t) * hash_size);
-
-
-#if PRINT_PERF
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-#endif
-
-
-#ifdef BaseSampleRate
-    if(BaseSampleRate == 2 && WordSize == 64)
-    {
-        GFixSizeChunking2(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }else if(BaseSampleRate == 3)
-    {
-        GFixSizeChunking_3(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }else if(BaseSampleRate == 4)
-    {
-        GFixSizeChunking_4(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    } else
-    {
-        GFixSizeChunking(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-    }
-
-#else
-    GFixSizeChunking(baseBuf + begSize, baseSize - begSize - endSize, beg, begSize, hash_table, bit, hashMask);
-#endif
-
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    fprintf(stderr, "size:%d\n", baseSize - begSize - endSize);
-    fprintf(stderr, "hash size:%d\n", hash_size);
-    fprintf(stderr, "rolling hash:%.3fMB/s\n",
-            (double)(baseSize - begSize - endSize) / 1024 / 1024 /
-                ((t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec) *
-                1000000000);
-    fprintf(stderr, "rolling hash:%zd\n",
-            (t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec);
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    fprintf(stderr, "hash table :%zd\n",
-            (t0.tv_sec - t1.tv_sec) * 1000000000 + t0.tv_nsec - t1.tv_nsec);
-#endif
-    /* end of inserting */
-
-
-    if (sizeof(FPTYPE) * 8 % WordSize == 0)
-        moveBitLength = sizeof(FPTYPE) * 8 / WordSize;
-    else
-        moveBitLength = sizeof(FPTYPE) * 8 / WordSize + 1;
-
-
-    for (uint32_t i = 0; i < WordSize && i < newSize - endSize - inputPos; i++) {
-        // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[(newBuf + inputPos)[i]];
-        fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[(newBuf + inputPos)[i]];
-    }
-
-    while (inputPos + WordSize <= newSize - endSize) {  // 使用的都是位置
-        uint32_t length;
-        bool matchflag = false;
-        cursor = inputPos + WordSize;
-        length = WordSize;
-
-        uint32_t offset = 0;    // 如果匹配的话，作为偏移起始位置进行处理
-        baseoffset = 0;
-
-        uint32_t hashBit = (fingerprint & (sizeof(fingerprint) * 8 - 1));
-        // if (((newHash >> hashBit) & 1ULL) == ((baseHash >> hashBit) & 1ULL)){
-        if (((newHash) & (1ULL << hashBit)) == ((baseHash) & (1ULL << hashBit))){
-                // uint32_t index = (fingerprint) >> moveindex;
-            // 计算位掩码
-            // FPTYPE indexMoveLength_mask = (1ULL << bit) - 1;
-            FPTYPE index = ((fingerprint) & hashMask);
-
-            baseoffset = hash_table[index]; // 这里的表和通过simhash的区别是什么？是否可以利用simhash进行跳过比较？
-                                        // 这里的哈希表，只取了simhash的前几位，和使用掩码的效果差不多？
-            if (memcmp(newBuf + inputPos, baseBuf + baseoffset, length) == 0){
-                matchflag = true;
-                offset = baseoffset;
-            }
+        capacity = std::max<std::size_t>(required, 1);
+        *out_buf = static_cast<std::uint8_t*>(std::malloc(capacity));
+        if (*out_buf == nullptr) {
+            return GDELTA_ALLOCATION_FAILED;
         }
+        allocated = true;
+    }
 
-        /* New data match found in hashtable/base data; attempt to create copy instruction*/
-        if (matchflag) {
-            matchNum++;
-            // Check how much is possible to copy
-            int32_t j = 0;
-#if 1 /* 8-bytes optimization */
-            while (offset + length + j + 7 < baseSize - endSize &&      // 如果匹配的话，检查匹配了多少，
-                   cursor + j + 7 < newSize - endSize &&
-                   *(uint64_t *) (baseBuf + offset + length + j) == *(uint64_t *) (newBuf + cursor + j)) {
-                j += sizeof(uint64_t);
-            }
-            while (offset + length + j < baseSize - endSize &&
-                   cursor + j < newSize - endSize &&
-                   baseBuf[offset + length + j] == newBuf[cursor + j]) {    // 最后一个字节一个字节地匹配
-                j++;
-            }
-#endif
-            cursor += j;
-
-            int32_t matchlen = cursor - inputPos;
-            handleBytes += cursor - inputPos;
-            uint64_t _offset = offset;  // 基块匹配位置的实际偏移
-
-            // Check if switching modes Literal -> Copy, and dump instruction if available
-            if (!unit.flag && unit.length) {
-                /* Detect if end of previous literal could have been a partial copy*/
-                uint32_t k = 0;
-                while (k + 1 <= offset && k + 1 <= unit.length) {   // 检测匹配位置之前是否有部分的匹配
-                    if (baseBuf[offset - (k + 1)] == newBuf[inputPos - (k + 1)])
-                        k++;
-                    else
-                        break;
-                }
-
-                if (k > 0) {
-                    // Reduce literal by the amount covered by the copy
-                    unit.length -= k;   // 这里需要对未匹配的进行处理，实际是需要插入的数据的长度
-                    // Set up adjusted copy parameters
-                    matchlen += k;
-                    _offset -= k;
-                }
-
-                if (unit.length != 0)
-                {
-                    write_unit(instStream, unit);
-                    stream_from(dataStream, newStream, lastLiteral_begin, unit.length); // 对前面未匹配的数据进行插入
-                }
-
-                unit.length = 0; // Mark written
-            }
-
-            unit.flag = true;
-            unit.offset = _offset;
-            unit.length = matchlen;
-            write_unit(instStream, unit);   // 对匹配的数据进行拷贝
-            unit.length = 0; // Mark written
-
-            // Update cursor (inputPos) and fingerprint
-            for (uint32_t k = cursor; k < cursor + WordSize && cursor + WordSize < newSize - endSize; k++) {
-                // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[k]];
-                fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[k]];
-            }
-
-            inputPos = cursor;
-            lastMatchPos = cursor;
-            lastLiteral_begin = cursor;
-        } else { // No match, need to write additional (literal) data
-            /*
-             * Accumulate length one byte at a time (as literal) in unit while no match is found
-             * Pre-emptively write to datastream
-             */
-            unit.flag = false;
-            unit.length += 1;
-
-            handleBytes += 1;
-            // Update cursor (inputPos) and fingerprint
-            if (inputPos + WordSize < newSize - endSize) {
-                // fingerprint = (fingerprint << (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-                fingerprint = (fingerprint >> (moveBitLength)) + GEARmx[newBuf[inputPos + WordSize]];
-            }
-            inputPos++;
+    std::size_t actual = 0;
+    const int status = gdecode_into(delta_buf, delta_size, base_buf, base_size,
+                                    *out_buf, capacity, &actual);
+    if (status != GDELTA_OK || actual > std::numeric_limits<std::uint32_t>::max() ||
+        actual > static_cast<std::size_t>(INT_MAX)) {
+        if (allocated) {
+            std::free(*out_buf);
+            *out_buf = nullptr;
         }
+        return status == GDELTA_OK ? GDELTA_INVALID_ARGUMENT : status;
     }
-
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "look up:%zd\n",
-            (t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec);
-    fprintf(stderr, "look up:%.3fMB/s\n",
-            (double)(baseSize - begSize - endSize) / 1024 / 1024 /
-                ((t1.tv_sec - t0.tv_sec) * 1000000000 + t1.tv_nsec - t0.tv_nsec) *
-                1000000000);
-#endif
-
-    endloop:
-    // If last unit was unwritten literal, update it to use the rest of the data
-    if ((!unit.flag && unit.length) || !isFindMatch) {
-        newStream.cursor = lastLiteral_begin;
-        stream_into(dataStream, newStream, newSize - endSize - lastLiteral_begin);
-
-        unit.length = (newSize - endSize - lastLiteral_begin);
-        write_unit(instStream, unit);
-        unit.length = 0;
-    } else { // Last unit was Copy, need new instruction
-        if (newSize - endSize - handleBytes) {
-            newStream.cursor = lastLiteral_begin;
-            stream_into(dataStream, newStream, newSize - endSize - lastLiteral_begin);
-
-            unit.flag = false;
-            unit.length = newSize - endSize - lastLiteral_begin;
-            write_unit(instStream, unit);
-            unit.length = 0;
-        }
-    }
-
-    if (end) {
-        int32_t matchLen = endSize;
-        int32_t offset = baseSize - endSize;
-
-        unit.flag = true;
-        unit.offset = offset;
-        unit.length = matchLen;
-        write_unit(instStream, unit);
-        unit.length = 0;
-    }
-
-    deltaStream.cursor = 0;
-    write_varint(deltaStream, instStream.cursor);
-    write_concat_buffer(deltaStream, instStream);
-    write_concat_buffer(deltaStream, dataStream);
-    *deltaSize = deltaStream.cursor;
-    *deltaBuf = deltaStream.buf;
-
-#if PRINT_PERF
-    clock_gettime(CLOCK_MONOTONIC, &tf1);
-    fprintf(stderr, "gencode took: %zdns\n", (tf1.tv_sec - tf0.tv_sec) * 1000000000 + tf1.tv_nsec - tf0.tv_nsec);
-#endif
-
-    free(dataStream.buf);
-    free(instStream.buf);
-    if (hash_table)
-        free(hash_table);
-
-
-    return deltaStream.cursor;
+    *out_size = static_cast<std::uint32_t>(actual);
+    return static_cast<int>(actual);
 }

@@ -1,37 +1,77 @@
 #ifndef GDELTA_GDELTA_H
 #define GDELTA_GDELTA_H
-using namespace std;
-#include <iostream>
-#include <cstdint>
-#include <bitset>
 
-/*****Parameter*****/
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+// Kept for the legacy gdeltaLshift.cpp translation unit.
 #define ChunkSize (300 * 1024)
 #define INIT_BUFFER_SIZE (128 * 1024)
 #define FPTYPE uint64_t
-//#define FPTYPE uint32_t
 #define WordSize 8
-// #define SkipStep 2
-// #define SkipOn  // 如果有2^(skipstep)位的不匹配，则快速跳过后面的bytes
 #define BaseSampleRate 2
-// #define ReverseMatch
-/*****Parameter*****/
-
 #define PRINT_PERF 0
 #define DEBUG_UNITS 0
 
 const int hashLength = 64;
 
-int gencode(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
-            uint32_t baseSize, uint8_t **deltaBuf, uint32_t *deltaSize);
+enum GdeltaStatus {
+    GDELTA_OK = 0,
+    GDELTA_INVALID_ARGUMENT = -1,
+    GDELTA_OUTPUT_TOO_SMALL = -2,
+    GDELTA_INVALID_DELTA = -3,
+    GDELTA_ALLOCATION_FAILED = -4,
+};
 
-int gencodeWHash(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
-            uint32_t baseSize, uint8_t **deltaBuf, uint32_t *deltaSize, uint64_t newHash, uint64_t baseHash);
+struct GdeltaStats {
+    std::size_t judgments = 0;
+    std::size_t excluded_lookups = 0;
+    std::size_t false_positive_lookups = 0;
+};
 
+// Keep one workspace per calling thread. Its allocations are retained between
+// calls and grow only when a larger chunk requires more capacity.
+struct GdeltaWorkspace {
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint8_t> instructions;
+    std::vector<std::uint32_t> hash_table;
+};
 
-int gdecode(uint8_t *deltaBuf, uint32_t deltaSize, uint8_t *baseBuf,
-            uint32_t baseSize, uint8_t **outBuf, uint32_t *outSize);
+// On success, *_size is the produced length. If the caller buffer is too
+// small, GDELTA_OUTPUT_TOO_SMALL is returned and *_size is the required length.
+// Any supplied stats object is reset at the start of each encode call.
+int gencode_into(const std::uint8_t* new_buf, std::size_t new_size,
+                 const std::uint8_t* base_buf, std::size_t base_size,
+                 std::uint8_t* delta_buf, std::size_t delta_capacity,
+                 std::size_t* delta_size, GdeltaWorkspace* workspace,
+                 GdeltaStats* stats = nullptr);
 
+int gencode_whash_into(const std::uint8_t* new_buf, std::size_t new_size,
+                       const std::uint8_t* base_buf, std::size_t base_size,
+                       std::uint64_t new_hash, std::uint64_t base_hash,
+                       std::uint8_t* delta_buf, std::size_t delta_capacity,
+                       std::size_t* delta_size, GdeltaWorkspace* workspace,
+                       GdeltaStats* stats = nullptr);
 
+int gdecode_into(const std::uint8_t* delta_buf, std::size_t delta_size,
+                 const std::uint8_t* base_buf, std::size_t base_size,
+                 std::uint8_t* out_buf, std::size_t out_capacity,
+                 std::size_t* out_size);
 
-#endif // GDELTA_GDELTA_H
+// Legacy allocation-capable wrappers. New code should use the bounded APIs
+// above; successful legacy calls continue to return the produced byte count.
+int gencode(const std::uint8_t* new_buf, std::uint32_t new_size,
+            const std::uint8_t* base_buf, std::uint32_t base_size,
+            std::uint8_t** delta_buf, std::uint32_t* delta_size);
+
+int gencodeWHash(const std::uint8_t* new_buf, std::uint32_t new_size,
+                 const std::uint8_t* base_buf, std::uint32_t base_size,
+                 std::uint8_t** delta_buf, std::uint32_t* delta_size,
+                 std::uint64_t new_hash, std::uint64_t base_hash);
+
+int gdecode(const std::uint8_t* delta_buf, std::uint32_t delta_size,
+            const std::uint8_t* base_buf, std::uint32_t base_size,
+            std::uint8_t** out_buf, std::uint32_t* out_size);
+
+#endif

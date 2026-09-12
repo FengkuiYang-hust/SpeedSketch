@@ -1,7 +1,6 @@
 #include <iostream>
 #include <cstdint>
-// #include "gdelta.h"
-#include "gdelta.cpp"
+#include "gdelta.h"
 #include "cstring"
 
 #define Chunk (10*1024*10)
