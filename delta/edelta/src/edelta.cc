@@ -39,7 +39,7 @@ int Chunking_v3(unsigned char *data, int len, int num_of_chunks,
   /* cut is the chunking points in the stream */
   cut = (int *)malloc((num_of_chunks + 1) * sizeof(int));
   int numBytes =
-      rolling_gear_v3(data, len, num_of_chunks, cut); //分割给定快的总字节数
+      rolling_gear_v3(data, len, num_of_chunks, cut); // Bytes chunked.
 
   while (i < num_of_chunks) {
     int chunkLen = cut[i + 1] - cut[i];
@@ -213,7 +213,7 @@ int EDeltaEncode(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
           numBytes = Chunking_v3(
               baseBuf + cursor_base, baseSize - endSize - cursor_base,
               chunk_number,
-              BaseLink + numBase); //一个分块base的循环找到 match的就可以跳出
+              BaseLink + numBase); // Stop after finding a matching base chunk.
 
           for (int j = 0; j < chunk_number; j++) {
             if (BaseLink[numBase + j].nLength == 0) {
@@ -283,7 +283,7 @@ int EDeltaEncode(uint8_t *newBuf, uint32_t newSize, uint8_t *baseBuf,
           flag_handle_probe = 0;
           goto match;
         } else {
-          if (flag == 2) { //把不match的块弄过去
+          if (flag == 2) { // Copy the unmatched chunk.
             /* continuous unique chunks only add unique bytes into the deltaBuf,
              * but not change the last DeltaUnit2, so the DeltaUnit2 should be
              * overwritten when flag=1 or at the end of the loop.

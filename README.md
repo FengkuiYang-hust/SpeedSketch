@@ -1,25 +1,25 @@
 # SpeedSketch
 
-SpeedSketch 是论文 *SpeedSketch: An Ultra-Fast Sketch Generation and Delta Encoding Framework for Delta Compression* 的开源研究实现。当前命令行程序用于在单个输入文件上比较 sketch/candidate search 与 Delta Encoding 组合。
+SpeedSketch is the open-source research implementation of *SpeedSketch: An Ultra-Fast Sketch Generation and Delta Encoding Framework for Delta Compression*. The current command-line program compares combinations of sketch or candidate search methods and delta encoders on a single input file.
 
-当前 FastCDC 的 min/avg/max 固定为 `4/8/32 KiB`。`4 KiB` 最小块是工程折中，有意偏离论文使用的 `2/8/32 KiB`；因此默认结果不声称是论文原始 FastCDC 参数下的复现。
+FastCDC currently uses fixed minimum, average, and maximum chunk sizes of `4/8/32 KiB`. The `4 KiB` minimum is an engineering tradeoff and intentionally differs from the paper's `2/8/32 KiB` configuration. Results produced with the default settings should therefore not be presented as a reproduction of the paper's original FastCDC configuration.
 
-## 构建与测试
+## Build and Test
 
-需要 GNU Make、支持 C++14/C99 的编译器和 zstd 开发库。
+The build requires GNU Make, compilers with C++14 and C99 support, and the zstd development library.
 
 ```sh
 make -j
 make check
 ```
 
-产物为 `./speedsketch`。CLI 黑盒测试只依赖 Python 标准库，也可直接指定 binary 和每次调用的超时：
+The resulting executable is `./speedsketch`. The CLI black-box tests depend only on the Python standard library. You can also specify the executable and per-command timeout directly:
 
 ```sh
 python3 tests/test_cli.py --binary ./speedsketch --timeout 30
 ```
 
-`make asan` 和 `make tsan` 分别运行 Address/UndefinedBehavior Sanitizer 与 Thread Sanitizer 检查；TSan target 使用 Linux `setarch` 关闭 ASLR，以避开本机 libtsan 的地址映射冲突。
+`make asan` runs the AddressSanitizer and UndefinedBehaviorSanitizer checks, while `make tsan` runs the ThreadSanitizer checks. The TSan target uses Linux `setarch` to disable ASLR and avoid a libtsan address-mapping conflict on this host.
 
 ## CLI
 
@@ -30,50 +30,50 @@ speedsketch --input PATH --scheme SCHEME
             [--json] [--no-verify]
 ```
 
-- `--input` 与 `--scheme` 必填；`--pipeline` 默认为 `parallel`。
-- `--json` 令 stdout 只输出一个 JSON object；诊断信息写 stderr。
-- 默认会对每个最终选中的 delta 或 self-compressed representation 执行 decode/decompress，并与原 chunk 逐字节比较。`--no-verify` 会关闭该门禁，只应用于明确标注的探索性计时。
-- `od-g`、`od-x` 必须显式提供正整数 `--features` 与 `--super-features`，且前者不小于并可整除后者；其他 scheme 拒绝这两个参数。
-- 正常完成返回 `0`，参数/配置错误返回 `2`，I/O、运行或验证失败返回 `1`。
-- 输入必须在一次运行中保持不变；程序会校验最终读取量，并拒绝无法补齐的读取或提前 EOF，但不会为同尺寸并发覆写创建快照。
+- `--input` and `--scheme` are required. `--pipeline` defaults to `parallel`.
+- `--json` makes stdout contain exactly one JSON object. Diagnostics are written to stderr.
+- By default, the program decodes or decompresses every selected delta or self-compressed representation and compares it byte for byte with the original chunk. `--no-verify` disables this gate and should be used only for explicitly labeled exploratory timing runs.
+- `od-g` and `od-x` require positive integer values for `--features` and `--super-features`. The feature count must be at least the super-feature count and must be evenly divisible by it. Other schemes reject these options.
+- A successful run returns `0`, an argument or configuration error returns `2`, and an I/O, runtime, or verification failure returns `1`.
+- The input must remain unchanged throughout a run. The program validates the final byte count and rejects reads that cannot be completed or encounter an early EOF, but it does not snapshot concurrent same-size overwrites.
 
-Scheme 与论文组合一致：
+The schemes match the combinations evaluated in the paper:
 
-| Scheme | 相似候选 | Delta encoder |
+| Scheme | Similarity candidate search | Delta encoder |
 |---|---|---|
-| `ss-g` | SpeedSketch | native Gdelta |
-| `ss-g-s` | SpeedSketch | sketch-accelerated Gdelta |
+| `ss-g` | SpeedSketch | Native Gdelta |
+| `ss-g-s` | SpeedSketch | Sketch-accelerated Gdelta |
 | `ss-x` | SpeedSketch | Xdelta |
-| `od-g` | Odess | native Gdelta |
+| `od-g` | Odess | Native Gdelta |
 | `od-x` | Odess | Xdelta |
 
-示例：
+Examples:
 
 ```sh
 ./speedsketch --input data.bin --scheme ss-g-s --pipeline parallel --json
 ./speedsketch --input data.bin --scheme od-g --features 12 --super-features 3 --json
 ```
 
-测试采用 `features=12`、`super-features=3` 作为一个合法、固定的 OD 覆盖配置；这不是论文声明的唯一参数，也不代表其他参数已经完成质量或性能验证。
+The tests use `features=12` and `super-features=3` as one valid, fixed Odess configuration. This is not claimed to be the paper's only configuration, and other values have not necessarily passed the same correctness or performance validation.
 
-## JSON metrics
+## JSON Metrics
 
-所有 schema key 始终存在；不适用或分母为零的值为 JSON `null`。
+Every schema key is always present. Values that do not apply or have a zero denominator are JSON `null`.
 
-- 身份与配置：`schema_version`、`input`、`scheme`、`pipeline`、`verify`、`features`、`super_features`。
-- 输入与分类：`input_bytes`、`chunks`、`unique_chunks`、`duplicate_chunks`、`similar_chunks`、`delta_chunks`、`self_compressed_chunks`、`raw_chunks`。`similar_chunks` 是找到 sketch/SF base 的 unique chunk 数；`delta_chunks` 只统计 delta payload 严格优于 raw 和 self-compressed 后被最终选中的数量。
-- 字节量：`after_dedup_bytes` 是 unique chunks 的原始字节和；`after_delta_bytes` 对有 base 的 chunk 累计 `min(raw chunk, raw delta)`，无 base 时累计 raw，因此不混入 ZSTD self-compression。最终估算对 G schemes 在 raw、`ZSTD(raw)`、`ZSTD(raw Gdelta)` 中择小，对 X schemes 在 raw、`ZSTD(raw)`、raw Xdelta 中择小；duplicates 计零。`estimated_final_payload_bytes` 不含持久化索引、recipe、container padding、journal 或其他 Archive metadata。
-- 读取量：`source_read_bytes` 是 stream reader 从输入顺序读取的字节，正常完成时等于 `input_bytes`；`base_read_bytes` 累计为 XXH64 collision/duplicate 逐字节确认和 similar-base encode 所做的 `pread`。
-- 缩减效果：`estimated_drr = input_bytes / estimated_final_payload_bytes`；`dce_pct = (1 - after_delta_bytes / after_dedup_bytes) * 100`。
-- lookup 过滤：`exclusion_rate_pct = excluded_lookups / lookup_judgments * 100`；`false_positive_rate_pct = false_positive_lookups / lookup_judgments * 100`，与论文式 (15) 一样以全部 judgments 为分母。
-- 时间与吞吐：`wall_seconds`、`chunking_seconds`、`dedup_seconds`、`sketch_seconds`、`encoding_seconds`、`verification_seconds`；wall 与前四个 pipeline stage 另有对应的 `*_mib_s`。这些字段会受 cache、调度和 verify 设置影响。
-- 正确性：`verification_checks` 与 `verification_failures`；默认验证时 checks 等于选中的 delta 与 self-compressed chunks 之和，正常运行要求 failures 为零。
+- Identity and configuration: `schema_version`, `input`, `scheme`, `pipeline`, `verify`, `features`, and `super_features`.
+- Input and classification: `input_bytes`, `chunks`, `unique_chunks`, `duplicate_chunks`, `similar_chunks`, `delta_chunks`, `self_compressed_chunks`, and `raw_chunks`. `similar_chunks` counts unique chunks for which a sketch or super-feature base was found. `delta_chunks` counts only delta payloads that were ultimately selected because they were strictly smaller than both the raw and self-compressed representations.
+- Byte counts: `after_dedup_bytes` is the sum of the original sizes of all unique chunks. For a chunk with a base, `after_delta_bytes` adds `min(raw chunk, raw delta)`; without a base, it adds the raw chunk size. This metric therefore excludes ZSTD self-compression. The final estimate for Gdelta schemes selects the smallest of raw data, `ZSTD(raw)`, and `ZSTD(Gdelta(raw))`; Xdelta schemes select the smallest of raw data, `ZSTD(raw)`, and raw Xdelta output. Duplicates contribute zero bytes. `estimated_final_payload_bytes` excludes persistent indexes, recipes, container padding, journals, and all other archive metadata.
+- Read volume: `source_read_bytes` is the number of bytes read sequentially from the input and equals `input_bytes` after a successful run. `base_read_bytes` counts bytes read with `pread` to confirm XXH64 collision or duplicate candidates and to encode against similar bases.
+- Data reduction: `estimated_drr = input_bytes / estimated_final_payload_bytes`; `dce_pct = (1 - after_delta_bytes / after_dedup_bytes) * 100`.
+- Lookup filtering: `exclusion_rate_pct = excluded_lookups / lookup_judgments * 100`; `false_positive_rate_pct = false_positive_lookups / lookup_judgments * 100`. Like equation (15) in the paper, the latter uses all judgments as its denominator.
+- Timing and throughput: `wall_seconds`, `chunking_seconds`, `dedup_seconds`, `sketch_seconds`, `encoding_seconds`, and `verification_seconds`. The wall time and first four pipeline stages also have corresponding `*_mib_s` fields. These values are affected by cache state, scheduling, and verification settings.
+- Correctness: `verification_checks` and `verification_failures`. With default verification, the number of checks equals the total number of selected delta and self-compressed chunks, and a successful run requires zero failures.
 
-`sequential` 与 `parallel` 使用相同算法和顺序语义；除 pipeline 名称、时间和吞吐字段外，逻辑 metrics 应完全一致。
+The `sequential` and `parallel` pipelines use the same algorithms and ordering semantics. Except for the pipeline name, timing, and throughput fields, their logical metrics should be identical.
 
-## 可行性输入与结果边界
+## Feasibility Fixture and Result Scope
 
-下面的脚本生成固定的 64 MiB 重复数据并施加稀疏、确定性修改，同时打印 SHA256；fixture 不写入仓库，且脚本拒绝覆盖已有路径：
+The following script generates a fixed 64 MiB data set with repeated regions and sparse deterministic modifications, then prints its SHA256 digest. The fixture is not stored in the repository, and the script refuses to overwrite an existing path.
 
 ```sh
 python3 tests/generate_feasibility.py /tmp/speedsketch-feasibility-64MiB.bin
@@ -83,6 +83,6 @@ python3 tests/generate_feasibility.py /tmp/speedsketch-feasibility-64MiB.bin
   --scheme ss-g-s --pipeline parallel --json
 ```
 
-这只构成 `0 warmup + 1 measure` 的可行性观测：保留单次原始输出，不计算平均值、置信区间，也不外推到论文完整数据集。正式性能结论需要固定环境和输入、基线、至少 `1 warmup + 5 measures`、原始结果及逐字节验证。
+This is only a `0 warmup + 1 measure` feasibility observation. Preserve the raw output from the single run; do not calculate an average or confidence interval, and do not extrapolate it to the paper's full data set. A formal performance result requires a fixed environment and input, a baseline, at least `1 warmup + 5 measures`, raw results, and byte-for-byte verification.
 
-当前程序是算法 simulator，不是可持久化的 Archive/restore 系统：它不实现 durable container、recipe/index 落盘、崩溃一致性、GC 或独立 restore 路径。因此 estimated payload、DRR、读字节和阶段吞吐不能解释为最终物理 Archive、恢复 I/O 或端到端 durable performance。
+The current program is an algorithm simulator, not a persistent archive and restore system. It does not implement durable containers, persistent recipes or indexes, crash consistency, garbage collection, or an independent restore path. The estimated payload, DRR, read volume, and stage throughput must not be interpreted as final physical archive size, restore I/O, or end-to-end durable performance.
